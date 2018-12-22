@@ -10,10 +10,60 @@ makeConf() {
   # NB <<"EOF" quotes / $ ` in heredocs, <<EOF does not
   mkdir -p /etc/nixos
   local IFS=$'\n'; keys=($(grep -vE '^[[:space:]]*(#|$)' /root/.ssh/authorized_keys))
+
   local network_import=""
 
-  [ "$PROVIDER" = "digitalocean" ] && network_import="./networking.nix # generated at runtime by nixos-infect"
-  cat > /etc/nixos/configuration.nix << EOF
+  if [ "$PROVIDER" = "lightsail" ]; then
+    cat > /etc/nixos/configuration.nix << EOF
+{ pkgs, config, options, ... }:
+{
+
+  imports = [
+    <nixpkgs/nixos/modules/virtualisation/amazon-image.nix>
+    $NIXOS_IMPORT
+  ];
+
+  boot.cleanTmpDir = true;
+
+  # Allows the Lightsail browser-based SSH client to connect.
+  services.openssh = {
+    kexAlgorithms = options.services.openssh.kexAlgorithms.default ++ [ "diffie-hellman-group14-sha1" ];
+    macs = options.services.openssh.macs.default ++ [ "hmac-sha1" ];
+    extraConfig = ''
+      TrustedUserCAKeys /etc/ssh/lightsail_instance_ca.pub
+      HostKey /etc/ssh/ssh_host_ecdsa_key
+    '';
+  };
+  environment.etc."ssh/lightsail_instance_ca.pub".text = "$(cat /etc/ssh/lightsail_instance_ca.pub)
+";
+
+  users.users.$defaultuser = {
+    uid = 1000;
+    extraGroups = [ "wheel" ];
+    isNormalUser = true;
+    openssh.authorizedKeys.keys = [ "$(cat /home/$defaultuser/.ssh/authorized_keys)" ];
+  };
+  security.sudo.wheelNeedsPassword = false;
+
+}
+EOF
+  else
+    if [ "$PROVIDER" = "digitalocean" ]; then
+      makeNetworkingConf
+      network_import="./networking.nix # generated at runtime by nixos-infect"
+    fi
+
+    # If you rerun this later, be sure to prune the filesSystems attr
+    cat > /etc/nixos/hardware-configuration.nix << EOF
+{ ... }:
+{
+  imports = [ <nixpkgs/nixos/modules/profiles/qemu-guest.nix> ];
+  boot.loader.grub.device = "/dev/$disk";
+  fileSystems."/" = { device = "/dev/${disk}1"; fsType = "ext4"; };
+}
+EOF
+  
+    cat > /etc/nixos/configuration.nix << EOF
 { ... }: {
   imports = [
     ./hardware-configuration.nix
@@ -23,28 +73,11 @@ makeConf() {
 
   boot.cleanTmpDir = true;
   networking.hostName = "$(hostname)";
-  networking.firewall.allowPing = true;
   services.openssh.enable = true;
-  users.users.root.openssh.authorizedKeys.keys = [$(for key in "${keys[@]}"; do echo -n "
-    \"$key\""; done)
+  users.users.root.openssh.authorizedKeys.keys = [$(for key in "${keys[@]}"; do echo ""; echo -n "''"; echo -n "$key"; echo -n "''"; done)
   ];
 }
 EOF
-  # If you rerun this later, be sure to prune the filesSystems attr
-  cat > /etc/nixos/hardware-configuration.nix << EOF
-{ ... }:
-{
-  imports = [ <nixpkgs/nixos/modules/profiles/qemu-guest.nix> ];
-  boot.loader.grub.device = "/dev/$disk";
-  fileSystems."/" = { device = "/dev/${disk}1"; fsType = "ext4"; };
-}
-EOF
-  
-  if [ "$PROVIDER" = "digitalocean" ]
-  then
-    makeNetworkingConf
-  else
-    true
   fi
 }
 
@@ -145,11 +178,16 @@ removeSwap() {
 
 prepareEnv() {
   # $disk is used in makeConf()
-  for disk in vda sda; do [[ -e /dev/$disk ]] && break; done
+  for disk in vda sda xvda; do [[ -e /dev/$disk ]] && break; done
 
   # DigitalOcean doesn't seem to set USER while running user data
   export USER="root"
   export HOME="/root"
+
+  # Lightsail has a default user the web SSH terminal connects to
+  if [ "$PROVIDER" = "lightsail" ]; then
+    defaultuser=$((getent passwd 1000 || getent passwd 500) | cut -d: -f1)
+  fi
 
   # Use adapted wget if curl is missing
   which curl || { \
@@ -203,9 +241,18 @@ checkEnv() {
   req ip               || { echo "ERROR: Missing ip";                 return 1; }
   req awk              || { echo "ERROR: Missing awk";                return 1; }
   req cut              || { echo "ERROR: Missing cut";                return 1; }
+  if [ "$PROVIDER" = "lightsail" ]; then
+    req find           || { echo "ERROR: Missing find";               return 1; }
+    req e2label        || { echo "ERROR: Missing e2label";            return 1; }
+  fi
 }
 
 infect() {
+  if [ "$PROVIDER" = "lightsail" ]; then
+    e2label /dev/${disk}1 nixos
+    touch /root/.initialized
+  fi
+
   # Add nix build users
   # FIXME run only if necessary, rather than defaulting true
   groupadd nixbld -g 30000 || true
@@ -227,7 +274,7 @@ infect() {
   export NIXOS_CONFIG=/etc/nixos/configuration.nix
 
   nix-env --set \
-    -I nixpkgs=$HOME/.nix-defexpr/channels/nixos \
+    -I nixpkgs=https://github.com/hyperfekt/nixpkgs/archive/fix-41826-18.09.tar.gz \
     -f '<nixpkgs/nixos>' \
     -p /nix/var/nix/profiles/system \
     -A system
@@ -244,13 +291,20 @@ infect() {
   echo etc/nixos                   > /etc/NIXOS_LUSTRATE
   echo etc/resolv.conf            >> /etc/NIXOS_LUSTRATE
   echo root/.nix-defexpr/channels >> /etc/NIXOS_LUSTRATE
+  if [ "$PROVIDER" = "lightsail" ]; then
+    echo root/.initialized              >> /etc/NIXOS_LUSTRATE
+    find /etc/ssh/ssh_host_* | cut -c2- >> /etc/NIXOS_LUSTRATE
+  fi
 
   rm -rf /boot.bak
   mv -v /boot /boot.bak
   /nix/var/nix/profiles/system/bin/switch-to-configuration boot
 }
 
-[ -z "$PROVIDER" ] && PROVIDER="digitalocean" # you may also prepend PROVIDER=vultr to your call instead
+if [ -z "$PROVIDER" ]; then
+  echo "No provider set!"
+  exit 1
+fi
 
 prepareEnv
 checkEnv
